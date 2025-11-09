@@ -130,7 +130,7 @@ class FJSPSolver:
                         f'presence_j{job_id}_o{op_idx}_m{machine_id}'
                     )
                     
-                    # 创建可变的duration
+                    # 创建可变的duration (关键: 默认值必须是含调机的时间!)
                     duration_var = self.model.NewIntVar(
                         proc_time_without, proc_time_with, 
                         f'duration_j{job_id}_o{op_idx}_m{machine_id}'
@@ -226,7 +226,7 @@ class FJSPSolver:
                                 f'i_before_j_m{machine_id}_j{job_i}o{op_i}_j{job_j}o{op_j}'
                             )
                             j_before_i = self.model.NewBoolVar(
-                                f'j_before_i_m{machine_id}_j{job_i}o{op_idx}_j{job_j}o{op_j}'
+                                f'j_before_i_m{machine_id}_j{job_i}o{op_i}_j{job_j}o{op_j}'
                             )
                             
                             self.model.Add(start_i == start_j).OnlyEnforceIf([both_present, fully_overlap])
@@ -262,8 +262,6 @@ class FJSPSolver:
         if self.setup_saved_vars:
             total_setup_saved = sum(self.setup_saved_vars)
             # 多目标: 最小化makespan,同时最大化调机节省
-            # 使用加权和: makespan - setup_saved * weight
-            # weight设置为1,使得每节省1分钟调机时间等价于减少1分钟makespan
             self.model.Minimize(self.makespan - total_setup_saved)
             print(f"✓ 添加多目标优化: 最小化makespan, 最大化调机节省")
         else:
@@ -273,9 +271,12 @@ class FJSPSolver:
     
     def _add_setup_optimization_constraints(self):
         """
-        添加调机优化约束
+        添加调机优化约束 - 修正版
         
-        关键改进: 不仅添加"可以省略调机"的约束,还要激励求解器选择这种方案
+        核心逻辑:
+        1. 默认所有任务都使用含调机的时间 (time_with)
+        2. 只有当任务j紧跟在同组任务i后面时,j才可以使用不含调机的时间 (time_without)
+        3. 通过"有且仅有一个前驱"或"是第一个"来确保逻辑正确
         """
         
         print("\n添加调机优化约束...")
@@ -327,30 +328,32 @@ class FJSPSolver:
             print(f"  订单{order_num}-工件{part_num}-工序{op_idx+1}-机器{machine_id}: "
                   f"发现{len(tasks)}个批次可优化")
             
-            # 对每对可能连续的批次添加约束
-            for i in range(len(tasks)):
-                task_i = tasks[i]
-                job_i = task_i['job_id']
+            # 对每个任务j,检查所有可能的前驱i
+            for j, task_j in enumerate(tasks):
+                job_j = task_j['job_id']
                 
-                for j in range(len(tasks)):
+                # 获取任务j的变量
+                presence_j = self.presence_vars[(job_j, op_idx, machine_id)]
+                duration_j, time_with, time_without = self.duration_vars[(job_j, op_idx, machine_id)]
+                setup_time_value = time_with - time_without
+                
+                if setup_time_value <= 0:
+                    continue
+                
+                start_j = self.start_vars[(job_j, op_idx)]
+                
+                # 创建所有"i→j"的布尔变量
+                follows_vars = []
+                
+                for i, task_i in enumerate(tasks):
                     if i == j:
                         continue
                     
-                    task_j = tasks[j]
-                    job_j = task_j['job_id']
+                    job_i = task_i['job_id']
                     
-                    # 获取变量
+                    # 获取任务i的变量
                     presence_i = self.presence_vars[(job_i, op_idx, machine_id)]
-                    presence_j = self.presence_vars[(job_j, op_idx, machine_id)]
-                    
-                    duration_j, time_with, time_without = self.duration_vars[(job_j, op_idx, machine_id)]
-                    setup_time_value = time_with - time_without
-                    
-                    if setup_time_value <= 0:
-                        continue
-                    
                     end_i = self.end_vars[(job_i, op_idx)]
-                    start_j = self.start_vars[(job_j, op_idx)]
                     
                     # 创建"j紧跟i"的布尔变量
                     j_follows_i = self.model.NewBoolVar(
@@ -364,27 +367,21 @@ class FJSPSolver:
                     self.model.AddBoolAnd([presence_i, presence_j]).OnlyEnforceIf(both_on_machine)
                     self.model.AddBoolOr([presence_i.Not(), presence_j.Not()]).OnlyEnforceIf(both_on_machine.Not())
                     
-                    # j_follows_i => (both_on_machine AND end_i == start_j)
+                    # j_follows_i <=> (both_on_machine AND end_i == start_j)
                     self.model.AddImplication(j_follows_i, both_on_machine)
                     self.model.Add(end_i == start_j).OnlyEnforceIf(j_follows_i)
                     
-                    # 如果j_follows_i,则duration_j使用不含调机的时间
-                    self.model.Add(duration_j == time_without).OnlyEnforceIf(j_follows_i)
+                    # 如果不是both_on_machine,则j_follows_i必须为False
+                    self.model.AddImplication(both_on_machine.Not(), j_follows_i.Not())
                     
-                    # 如果不紧跟且都在这台机器,则必须使用含调机的时间
-                    not_follows_but_both = self.model.NewBoolVar(
-                        f'not_follows_but_both_m{machine_id}_j{job_i}_j{job_j}_op{op_idx}'
-                    )
-                    self.model.AddBoolAnd([both_on_machine, j_follows_i.Not()]).OnlyEnforceIf(not_follows_but_both)
-                    self.model.Add(duration_j == time_with).OnlyEnforceIf(not_follows_but_both)
+                    follows_vars.append(j_follows_i)
                     
-                    # 创建"节省调机时间"的整数变量,用于目标函数
+                    # 创建"节省调机时间"的整数变量
                     setup_saved = self.model.NewIntVar(
                         0, setup_time_value,
                         f'setup_saved_m{machine_id}_j{job_i}_to_j{job_j}_op{op_idx}'
                     )
                     
-                    # 如果j_follows_i,则setup_saved = setup_time_value,否则=0
                     self.model.Add(setup_saved == setup_time_value).OnlyEnforceIf(j_follows_i)
                     self.model.Add(setup_saved == 0).OnlyEnforceIf(j_follows_i.Not())
                     
@@ -403,9 +400,30 @@ class FJSPSolver:
                     })
                     
                     setup_count += 1
+                
+                # 关键约束: 如果presence_j为True,则:
+                # - 要么有且仅有一个前驱 (sum(follows_vars) == 1),此时duration_j = time_without
+                # - 要么没有前驱 (sum(follows_vars) == 0),此时duration_j = time_with
+                if follows_vars:
+                    has_predecessor = self.model.NewBoolVar(
+                        f'has_pred_m{machine_id}_j{job_j}_op{op_idx}'
+                    )
+                    
+                    # has_predecessor <=> sum(follows_vars) >= 1
+                    self.model.Add(sum(follows_vars) >= 1).OnlyEnforceIf([presence_j, has_predecessor])
+                    self.model.Add(sum(follows_vars) == 0).OnlyEnforceIf([presence_j, has_predecessor.Not()])
+                    
+                    # 如果有前驱,则duration = time_without
+                    self.model.Add(duration_j == time_without).OnlyEnforceIf([presence_j, has_predecessor])
+                    
+                    # 如果没有前驱,则duration = time_with (必须包含调机时间!)
+                    self.model.Add(duration_j == time_with).OnlyEnforceIf([presence_j, has_predecessor.Not()])
+                    
+                    # 最多只能有一个前驱
+                    self.model.Add(sum(follows_vars) <= 1).OnlyEnforceIf(presence_j)
         
         print(f"  共添加 {setup_count} 个调机优化约束")
-        print(f"  目标函数将激励求解器最大化调机节省")
+        print(f"  每个任务默认含调机时间,只有紧跟前驱时才省略")
     
     def solve(self, time_limit_seconds=300):
         """求解模型"""
@@ -477,14 +495,6 @@ class FJSPSolver:
                     if (job_id, op_idx, machine_id) in self.presence_vars:
                         if self.solver.Value(self.presence_vars[(job_id, op_idx, machine_id)]):
                             selected_machine = machine_id
-                            
-                            # 打印duration调试信息
-                            if (job_id, op_idx, machine_id) in self.duration_vars:
-                                duration_var, time_with, time_without = self.duration_vars[(job_id, op_idx, machine_id)]
-                                solved_duration = self.solver.Value(duration_var)
-                                if solved_duration < time_with:
-                                    print(f"  J{job_id}-O{op_idx}-M{machine_id}: duration={solved_duration} "
-                                          f"(优化! 原本={time_with})")
                             break
                 
                 schedule.append({
